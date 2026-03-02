@@ -1,9 +1,21 @@
-# MIT License (Uzbek Translation, Informational)
+# SHAHARSOZ Non-Commercial License v1.0 (Uzbek Translation, Informational)
 
-Bu fayl MIT litsenziyasining norasmiy o'zbekcha tarjimasidir va ma'lumot uchun berilgan.
+Bu fayl `LICENSE` faylidagi inglizcha matnning norasmiy o'zbekcha izohli tarjimasidir.
 Rasmiy huquqiy kuchga ega matn `LICENSE` faylidagi inglizcha versiyadir.
 
-`LICENSE` faylidagi shartlarga ko'ra, ushbu dastur kodidan bepul foydalanish, nusxa olish,
-o'zgartirish, tarqatish va tijorat maqsadlarida ishlatish mumkin.
+## Qisqacha mazmun
 
-Dastur "bor holicha" taqdim etiladi, hech qanday kafolatlarsiz.
+Quyidagilar uchun foydalanish ruxsat etiladi:
+- shaxsiy loyihalar,
+- ta'limiy maqsadlar,
+- akademik va notijorat tadqiqotlar.
+
+Quyidagilar taqiqlanadi:
+- tijorat maqsadida foydalanish,
+- dastur yoki hosila ishlarni sotish,
+- pullik xizmat/SaaS yoki biznes ichki jarayonlarida ishlatish,
+- mijoz uchun pullik ishda qo'llash.
+
+Litsenziya matni va mualliflik eslatmasi nusxa/hosila fayllarda saqlanishi shart.
+
+Dastur "bor holicha" beriladi, kafolat berilmaydi.

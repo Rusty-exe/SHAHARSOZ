@@ -179,5 +179,5 @@ Do **not** delete if you still need app code/config:
 
 ## License / Litsenziya
 
-- Code: MIT (`LICENSE`)
+- Code: SHAHARSOZ Non-Commercial License v1.0 (`LICENSE`)
 - Data usage rights vary by provider (`DATA_AND_LEGAL_NOTICE.md`)
