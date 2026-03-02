@@ -1,0 +1,11 @@
+Expected stems / Kutiladigan nomlar:
+- `asphalt`
+- `cobblestone`
+- `concrete`
+- `grass`
+- `railway`
+- `roof`
+- `stone`
+- `wall_window`
+- `water`
+- `tree`

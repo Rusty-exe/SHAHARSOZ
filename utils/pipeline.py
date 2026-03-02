@@ -9,12 +9,15 @@ import logging
 import math
 import os
 import re
+import shutil
+import sys
 import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Iterable, Tuple
 
+from affine import Affine
 import geopandas as gpd
 import numpy as np
 import osmnx as ox
@@ -546,6 +549,32 @@ def _stretch_to_uint8(array: np.ndarray, low_pct: float = 2.0, high_pct: float =
     return out
 
 
+def _copy_raster(src_path: Path, dst_path: Path) -> Path:
+    """Copy raster file preserving georeferencing metadata."""
+    dst_path.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(src_path, dst_path)
+    return dst_path
+
+
+def _upscale_raster_nearest(src_path: Path, dst_path: Path, scale_factor: int) -> Path:
+    """Upscale raster by integer factor using nearest-neighbor replication."""
+    if scale_factor <= 1:
+        return _copy_raster(src_path, dst_path)
+    with rasterio.open(src_path) as src:
+        data = src.read()
+        up = np.repeat(np.repeat(data, scale_factor, axis=1), scale_factor, axis=2)
+        profile = _sanitize_gtiff_profile(src.profile.copy())
+        profile.update(
+            height=up.shape[1],
+            width=up.shape[2],
+            transform=src.transform * Affine.scale(1.0 / scale_factor, 1.0 / scale_factor),
+            compress="lzw",
+        )
+    with rasterio.open(dst_path, "w", **profile) as dst:
+        dst.write(up)
+    return dst_path
+
+
 def get_sentinel_data(lat: float, lon: float, radius_km: float, data_dir: Path) -> Tuple[Path, Path]:
     """Download Sentinel-2 bands, clip/reproject, and save visual products."""
     log = logging.getLogger("shaharsoz.sentinel")
@@ -648,17 +677,56 @@ def get_basemap_texture(
 
     width = max(512, min(4096, int(math.ceil((maxx - minx) / texture_resolution_m))))
     height = max(512, min(4096, int(math.ceil((maxy - miny) / texture_resolution_m))))
+    sizes = []
+    w, h = width, height
+    while True:
+        sizes.append((w, h))
+        if max(w, h) <= 1024:
+            break
+        w = max(512, w // 2)
+        h = max(512, h // 2)
 
     basemap_path = data_dir / "basemap_rgb_3857.tif"
     if wayback_layer_id is not None:
+        for req_w, req_h in sizes:
+            try:
+                url = _arcgis_export_url(
+                    base_url=ESRI_WAYBACK_EXPORT_URL,
+                    bounds_3857=bounds_3857,
+                    width=req_w,
+                    height=req_h,
+                    image_format="jpg",
+                    extra_params={"transparent": "false", "layers": f"show:{int(wayback_layer_id)}"},
+                )
+                _download_arcgis_raster_to_geotiff(
+                    url=url,
+                    dst_path=basemap_path,
+                    bounds_3857=bounds_3857,
+                    dtype="uint8",
+                    count=3,
+                    nodata=0,
+                )
+                log.info(
+                    "Basemap texture prepared from Esri Wayback layer %s (%dx%d): %s",
+                    wayback_layer_id,
+                    req_w,
+                    req_h,
+                    basemap_path,
+                )
+                return basemap_path
+            except Exception as exc:
+                log.warning("Wayback %s failed at %dx%d (%s)", wayback_layer_id, req_w, req_h, exc)
+        log.warning("Wayback layer %s unavailable for AOI. Falling back to Esri World Imagery.", wayback_layer_id)
+
+    for req_w, req_h in sizes:
         try:
             url = _arcgis_export_url(
-                base_url=ESRI_WAYBACK_EXPORT_URL,
+                base_url=ESRI_WORLD_IMAGERY_EXPORT_URL,
                 bounds_3857=bounds_3857,
-                width=width,
-                height=height,
+                width=req_w,
+                height=req_h,
                 image_format="jpg",
-                extra_params={"transparent": "false", "layers": f"show:{int(wayback_layer_id)}"},
+                extra_params={"transparent": "false"},
             )
             _download_arcgis_raster_to_geotiff(
                 url=url,
@@ -668,29 +736,12 @@ def get_basemap_texture(
                 count=3,
                 nodata=0,
             )
-            log.info("Basemap texture prepared from Esri Wayback layer %s: %s", wayback_layer_id, basemap_path)
+            log.info("Basemap texture prepared from Esri World Imagery (%dx%d): %s", req_w, req_h, basemap_path)
             return basemap_path
         except Exception as exc:
-            log.warning("Wayback layer %s unavailable (%s). Falling back to Esri World Imagery.", wayback_layer_id, exc)
+            log.warning("World Imagery failed at %dx%d (%s)", req_w, req_h, exc)
 
-    url = _arcgis_export_url(
-        base_url=ESRI_WORLD_IMAGERY_EXPORT_URL,
-        bounds_3857=bounds_3857,
-        width=width,
-        height=height,
-        image_format="jpg",
-        extra_params={"transparent": "false"},
-    )
-    _download_arcgis_raster_to_geotiff(
-        url=url,
-        dst_path=basemap_path,
-        bounds_3857=bounds_3857,
-        dtype="uint8",
-        count=3,
-        nodata=0,
-    )
-    log.info("Basemap texture prepared from Esri World Imagery: %s", basemap_path)
-    return basemap_path
+    raise ShaharsozError("Basemap download failed for all requested resolutions")
 
 
 def _to_uint8_hwc(array_chw: np.ndarray) -> np.ndarray:
@@ -882,30 +933,48 @@ def _download_reference_basemap_array(
     wayback_layer_id: int | None = 64001,
 ) -> np.ndarray:
     """Download reference RGB basemap as HWC uint8 array for alignment."""
+    sizes = []
+    w, h = width, height
+    while True:
+        sizes.append((w, h))
+        if max(w, h) <= 1024:
+            break
+        w = max(512, w // 2)
+        h = max(512, h // 2)
+
     payload = None
     if wayback_layer_id is not None:
-        try:
-            url = _arcgis_export_url(
-                base_url=ESRI_WAYBACK_EXPORT_URL,
-                bounds_3857=bounds_3857,
-                width=width,
-                height=height,
-                image_format="jpg",
-                extra_params={"transparent": "false", "layers": f"show:{int(wayback_layer_id)}"},
-            )
-            payload = _fetch_bytes(url)
-        except Exception:
-            payload = None
+        for req_w, req_h in sizes:
+            try:
+                url = _arcgis_export_url(
+                    base_url=ESRI_WAYBACK_EXPORT_URL,
+                    bounds_3857=bounds_3857,
+                    width=req_w,
+                    height=req_h,
+                    image_format="jpg",
+                    extra_params={"transparent": "false", "layers": f"show:{int(wayback_layer_id)}"},
+                )
+                payload = _fetch_bytes(url)
+                break
+            except Exception:
+                payload = None
     if payload is None:
-        url = _arcgis_export_url(
-            base_url=ESRI_WORLD_IMAGERY_EXPORT_URL,
-            bounds_3857=bounds_3857,
-            width=width,
-            height=height,
-            image_format="jpg",
-            extra_params={"transparent": "false"},
-        )
-        payload = _fetch_bytes(url)
+        for req_w, req_h in sizes:
+            try:
+                url = _arcgis_export_url(
+                    base_url=ESRI_WORLD_IMAGERY_EXPORT_URL,
+                    bounds_3857=bounds_3857,
+                    width=req_w,
+                    height=req_h,
+                    image_format="jpg",
+                    extra_params={"transparent": "false"},
+                )
+                payload = _fetch_bytes(url)
+                break
+            except Exception:
+                payload = None
+    if payload is None:
+        raise ShaharsozError("Reference basemap download failed for alignment")
 
     with MemoryFile(payload) as memfile:
         with memfile.open() as src:
@@ -1644,7 +1713,7 @@ def generate_tree_mesh(
     tree_mesh = meshes[0]
     for m in meshes[1:]:
         tree_mesh = tree_mesh.merge(m, merge_points=False)
-    tree_mesh = tree_mesh.extract_surface().triangulate().clean()
+    tree_mesh = tree_mesh.extract_surface(algorithm="dataset_surface").triangulate().clean()
     tree_gdf = gpd.GeoDataFrame(geometry=tree_points, crs=TARGET_CRS)
     log.info("Tree mesh built: %d trees, %d points, %d faces", len(tree_points), tree_mesh.n_points, tree_mesh.n_cells)
     return tree_mesh, tree_gdf
@@ -1677,12 +1746,11 @@ def _blend_basemap_with_osm(
             bld_mask = features.rasterize(bld_shapes, out_shape=shape_hw, transform=transform, fill=0, dtype=np.uint8)
 
     texture = rgb.copy()
-    # Darken roads for readability in game engines.
+    # Keep overlays subtle so satellite/base imagery remains natural.
     for band in range(3):
-        texture[band][roads_mask == 1] *= 0.55
-    # Slightly brighten rooftops to pop blockout massing.
+        texture[band][roads_mask == 1] *= 0.82
     for band in range(3):
-        texture[band][bld_mask == 1] = np.clip(texture[band][bld_mask == 1] * 1.15 + 12.0, 0, 255)
+        texture[band][bld_mask == 1] = np.clip(texture[band][bld_mask == 1] * 1.05 + 4.0, 0, 255)
 
     out_png_path.parent.mkdir(parents=True, exist_ok=True)
     profile = {
@@ -1694,6 +1762,41 @@ def _blend_basemap_with_osm(
     }
     with rasterio.open(out_png_path, "w", **profile) as dst:
         dst.write(np.clip(texture, 0, 255).astype(np.uint8))
+    return out_png_path
+
+
+def _raster_to_png_texture(src_path: Path, out_png_path: Path) -> Path:
+    """Convert raster to PNG RGB texture with optional contrast recovery."""
+    with rasterio.open(src_path) as src:
+        data = src.read()
+    rgb = _to_uint8_hwc(data)
+
+    # If a provider export is too dark/flat, expand contrast to avoid black-looking terrain.
+    gray = (
+        rgb[..., 0].astype(np.float32) * 0.2989
+        + rgb[..., 1].astype(np.float32) * 0.5870
+        + rgb[..., 2].astype(np.float32) * 0.1140
+    )
+    if float(np.percentile(gray, 98)) - float(np.percentile(gray, 2)) < 6.0:
+        stretched = rgb.astype(np.float32)
+        for band in range(3):
+            b = stretched[..., band]
+            lo = float(np.percentile(b, 2))
+            hi = float(np.percentile(b, 98))
+            if hi > lo:
+                stretched[..., band] = np.clip((b - lo) / (hi - lo), 0.0, 1.0) * 255.0
+        rgb = np.clip(stretched, 0, 255).astype(np.uint8)
+
+    out_png_path.parent.mkdir(parents=True, exist_ok=True)
+    profile = {
+        "driver": "PNG",
+        "height": rgb.shape[0],
+        "width": rgb.shape[1],
+        "count": 3,
+        "dtype": "uint8",
+    }
+    with rasterio.open(out_png_path, "w", **profile) as dst:
+        dst.write(rgb.transpose(2, 0, 1))
     return out_png_path
 
 
@@ -1718,12 +1821,13 @@ def export_textured_terrain_obj(
     maxx, maxy = float(points[:, 0].max()), float(points[:, 1].max())
     dx = max(maxx - minx, 1e-6)
     dy = max(maxy - miny, 1e-6)
+    # Rotate terrain texture mapping by 180 degrees.
     u = (points[:, 0] - minx) / dx
-    v = 1.0 - ((points[:, 1] - miny) / dy)
+    v = (points[:, 1] - miny) / dy
 
     output_obj_path.parent.mkdir(parents=True, exist_ok=True)
     mtl_path = output_obj_path.with_suffix(".mtl")
-    tex_rel = texture_png_path.name
+    tex_rel = Path(os.path.relpath(texture_png_path, output_obj_path.parent)).as_posix()
     with mtl_path.open("w", encoding="utf-8") as mtl:
         mtl.write("newmtl terrain_mat\n")
         mtl.write("Ka 1.000 1.000 1.000\n")
@@ -1806,7 +1910,7 @@ def export_textured_blockout_obj(
         "tree",
     ]
     tile_m = {
-        "terrain_sat": 20.0,
+        "terrain_sat": 256.0,
         "asphalt": 4.0,
         "cobblestone": 2.0,
         "concrete": 5.0,
@@ -1838,6 +1942,8 @@ def export_textured_blockout_obj(
     tex_paths: dict[str, Path | None] = {name: _find_material_texture(material_dir, name) for name in material_order}
     if terrain_texture_path is not None and terrain_texture_path.exists():
         tex_paths["terrain_sat"] = terrain_texture_path
+        if tex_paths.get("roof") is None:
+            tex_paths["roof"] = terrain_texture_path
     fallback = tex_paths.get("concrete")
     for name in material_order:
         if tex_paths[name] is None:
@@ -1860,7 +1966,7 @@ def export_textured_blockout_obj(
         if tex is None:
             continue
         dst = material_output_dir / tex.name
-        if not dst.exists():
+        if tex.resolve() != dst.resolve():
             dst.write_bytes(tex.read_bytes())
 
     with output_obj_path.open("w", encoding="utf-8") as obj:
@@ -1919,6 +2025,27 @@ def export_textured_blockout_obj(
             else:
                 mat_name = component_material.get(comp_name, "concrete")
                 obj.write(f"usemtl {mat_name}\n")
+                if comp_name == "terrain" and terrain_texture_path is not None:
+                    minx = float(points[:, 0].min())
+                    maxx = float(points[:, 0].max())
+                    miny = float(points[:, 1].min())
+                    maxy = float(points[:, 1].max())
+                    dx = max(maxx - minx, 1e-6)
+                    dy = max(maxy - miny, 1e-6)
+                    for ids in _iter_mesh_triangles(tri_mesh):
+                        tri_pts = points[ids]
+                        uv = np.empty((3, 2), dtype=np.float64)
+                        uv[:, 0] = (tri_pts[:, 0] - minx) / dx
+                        uv[:, 1] = (tri_pts[:, 1] - miny) / dy
+                        obj.write(f"vt {uv[0,0]:.6f} {uv[0,1]:.6f}\n")
+                        obj.write(f"vt {uv[1,0]:.6f} {uv[1,1]:.6f}\n")
+                        obj.write(f"vt {uv[2,0]:.6f} {uv[2,1]:.6f}\n")
+                        a, b, c = (int(ids[0]) + v_offset, int(ids[1]) + v_offset, int(ids[2]) + v_offset)
+                        ta, tb, tc = vt_offset, vt_offset + 1, vt_offset + 2
+                        obj.write(f"f {a}/{ta} {b}/{tb} {c}/{tc}\n")
+                        vt_offset += 3
+                    v_offset += points.shape[0]
+                    continue
                 for ids in _iter_mesh_triangles(tri_mesh):
                     tri_pts = points[ids]
                     n = np.cross(tri_pts[1] - tri_pts[0], tri_pts[2] - tri_pts[0])
@@ -1955,10 +2082,31 @@ def _export_lods_and_collision(base_mesh: pv.PolyData, lod_dir: Path, collision_
     lod1_path = lod_dir / "blockout_lod1.obj"
     lod2_path = lod_dir / "blockout_lod2.obj"
 
-    mesh = base_mesh.extract_surface(algorithm="dataset_surface").triangulate().clean()
-    collision = mesh.decimate_pro(0.92, preserve_topology=True).clean()
-    lod1 = mesh.decimate_pro(0.50, preserve_topology=True).clean()
-    lod2 = mesh.decimate_pro(0.75, preserve_topology=True).clean()
+    mesh = base_mesh.copy()
+    for arr_name in ("vtkOriginalPointIds", "vtkOriginalCellIds"):
+        if arr_name in mesh.point_data:
+            mesh.point_data.pop(arr_name)
+        if arr_name in mesh.cell_data:
+            mesh.cell_data.pop(arr_name)
+
+    mesh = mesh.extract_surface(pass_pointid=False, pass_cellid=False, algorithm="dataset_surface")
+    try:
+        mesh = mesh.triangulate(pass_verts=False, pass_lines=False).clean()
+    except TypeError:
+        mesh = mesh.triangulate().clean()
+
+    if mesh.n_cells == 0:
+        raise ShaharsozError("Cannot export LOD/collision from empty combined mesh")
+
+    try:
+        collision = mesh.decimate_pro(0.92, preserve_topology=True).clean()
+        lod1 = mesh.decimate_pro(0.50, preserve_topology=True).clean()
+        lod2 = mesh.decimate_pro(0.75, preserve_topology=True).clean()
+    except Exception as exc:
+        logging.getLogger("shaharsoz.lod").warning("Decimation failed (%s). Exporting fallback non-decimated LOD meshes.", exc)
+        collision = mesh.clean()
+        lod1 = mesh.clean()
+        lod2 = mesh.clean()
 
     export_obj(collision, collision_path)
     export_obj(lod1, lod1_path)
@@ -2005,8 +2153,8 @@ def main() -> None:
     parser.add_argument(
         "--wayback-layer-id",
         type=int,
-        default=64001,
-        help="Esri Wayback layer id for imagery snapshot (default: 64001). Set 0 to use current World Imagery.",
+        default=0,
+        help="Esri Wayback layer id for imagery snapshot (default: 0 = current World Imagery).",
     )
     parser.add_argument(
         "--input-dir",
@@ -2039,13 +2187,36 @@ def main() -> None:
         help="NDWI threshold for Sentinel-derived water mask (default: 0.12)",
     )
     parser.add_argument(
+        "--sentinel-upscale",
+        type=int,
+        default=2,
+        help="Integer upscale factor for Sentinel preview rasters used in texture fallback (default: 2)",
+    )
+    parser.add_argument(
         "--no-input-texture",
         action="store_true",
         help="Disable local screenshot texture lookup from --input-dir",
     )
+    parser.add_argument(
+        "--terrain-osm-overlay",
+        action="store_true",
+        help="Blend OSM roads/buildings onto terrain texture (off by default for cleaner satellite texture).",
+    )
     parser.add_argument("--verbose", action="store_true", help="Enable debug logging")
 
-    args = parser.parse_args()
+    if len(sys.argv) == 1 and sys.stdin.isatty():
+        print("SHAHARSOZ interactive mode")
+        try:
+            lat = input("Latitude: ").strip()
+            lon = input("Longitude: ").strip()
+            radius = input("Radius (km): ").strip()
+            output_name = input("Output folder name: ").strip()
+        except KeyboardInterrupt:
+            print("\nCancelled by user.")
+            raise SystemExit(130)
+        args = parser.parse_args(["--lat", lat, "--lon", lon, "--radius", radius, "--output", output_name])
+    else:
+        args = parser.parse_args()
     configure_logging(args.verbose)
 
     root = Path(__file__).resolve().parents[1]
@@ -2112,6 +2283,15 @@ def main() -> None:
             except Exception as exc:
                 logging.getLogger("shaharsoz.basemap").warning("Basemap texture skipped: %s", exc)
         red_path, nir_path = get_sentinel_data(args.lat, args.lon, args.radius, data_imagery_dir)
+        sentinel_preview = data_imagery_dir / "sentinel_rgb_preview.tif"
+        sentinel_upscaled_preview = data_imagery_dir / "sentinel_rgb_preview_upscaled.tif"
+        if sentinel_preview.exists():
+            _upscale_raster_nearest(
+                src_path=sentinel_preview,
+                dst_path=sentinel_upscaled_preview,
+                scale_factor=max(1, int(args.sentinel_upscale)),
+            )
+
         vegetation = compute_ndvi(nir_path=nir_path, red_path=red_path, data_dir=data_masks_dir)
         ndwi_water = compute_ndwi_water(
             green_path=data_imagery_dir / "sentinel_b03_3857.tif",
@@ -2119,6 +2299,13 @@ def main() -> None:
             data_dir=data_masks_dir,
             threshold=args.ndwi_threshold,
         )
+        for src, dst in (
+            (data_masks_dir / "ndvi_preview.tif", data_masks_dir / "ndvi_preview_upscaled.tif"),
+            (data_masks_dir / "vegetation_mask_preview.tif", data_masks_dir / "vegetation_mask_preview_upscaled.tif"),
+            (data_masks_dir / "water_mask_preview.tif", data_masks_dir / "water_mask_preview_upscaled.tif"),
+        ):
+            if src.exists():
+                _upscale_raster_nearest(src_path=src, dst_path=dst, scale_factor=max(1, int(args.sentinel_upscale)))
         if not ndwi_water.empty:
             merged_water_geoms = list(water.geometry) + list(ndwi_water.geometry)
             water = gpd.GeoDataFrame(geometry=merged_water_geoms, crs=TARGET_CRS)
@@ -2200,25 +2387,39 @@ def main() -> None:
 
         terrain_texture_png: Path | None = None
         if basemap_path is not None and basemap_path.exists():
-            texture_png = _blend_basemap_with_osm(
-                basemap_path=basemap_path,
-                roads=roads,
-                buildings=buildings,
-                out_png_path=output_textures_dir / "terrain_texture.png",
-            )
+            if args.terrain_osm_overlay:
+                texture_png = _blend_basemap_with_osm(
+                    basemap_path=basemap_path,
+                    roads=roads,
+                    buildings=buildings,
+                    out_png_path=output_textures_dir / "terrain_texture.png",
+                )
+            else:
+                texture_png = _raster_to_png_texture(
+                    src_path=basemap_path,
+                    out_png_path=output_textures_dir / "terrain_texture.png",
+                )
             terrain_texture_png = texture_png
             export_textured_terrain_obj(
                 terrain_mesh=terrain_mesh,
                 texture_png_path=texture_png,
                 output_obj_path=terrain_textured_obj,
             )
-        elif (data_imagery_dir / "sentinel_rgb_preview.tif").exists():
-            texture_png = _blend_basemap_with_osm(
-                basemap_path=data_imagery_dir / "sentinel_rgb_preview.tif",
-                roads=roads,
-                buildings=buildings,
-                out_png_path=output_textures_dir / "terrain_texture.png",
-            )
+        elif sentinel_upscaled_preview.exists() or sentinel_preview.exists():
+            fallback_basemap = sentinel_upscaled_preview if sentinel_upscaled_preview.exists() else sentinel_preview
+            basemap_path = _copy_raster(fallback_basemap, data_imagery_dir / "basemap_rgb_3857.tif")
+            if args.terrain_osm_overlay:
+                texture_png = _blend_basemap_with_osm(
+                    basemap_path=basemap_path,
+                    roads=roads,
+                    buildings=buildings,
+                    out_png_path=output_textures_dir / "terrain_texture.png",
+                )
+            else:
+                texture_png = _raster_to_png_texture(
+                    src_path=basemap_path,
+                    out_png_path=output_textures_dir / "terrain_texture.png",
+                )
             terrain_texture_png = texture_png
             export_textured_terrain_obj(
                 terrain_mesh=terrain_mesh,

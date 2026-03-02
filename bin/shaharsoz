@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-python3 "$SCRIPT_DIR/../shaharsoz.py" "$@"
+if [ -x "$SCRIPT_DIR/../.venv/bin/python" ]; then
+  "$SCRIPT_DIR/../.venv/bin/python" "$SCRIPT_DIR/../shaharsoz.py" "$@"
+else
+  python3 "$SCRIPT_DIR/../shaharsoz.py" "$@"
+fi
