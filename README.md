@@ -22,16 +22,29 @@ pip install -r requirements.txt
 
 ## Run / Ishga tushirish
 
+### From project folder (recommended)
+
+```bash
+cd /path/to/SHAHARSOZ
+./shaharsoz --lat 41.3111 --lon 69.2797 --radius 4 --output tashkent_model
+```
+
+If you run `./shaharsoz` without arguments in terminal, SHAHARSOZ opens interactive prompts.
+
+### Using Python directly
+
 ```bash
 cd /path/to/SHAHARSOZ
 source .venv/bin/activate
 python shaharsoz.py --lat 41.3111 --lon 69.2797 --radius 4 --output tashkent_model
 ```
 
-Or launcher:
+### Use `shaharsoz` globally (optional)
 
 ```bash
-/path/to/SHAHARSOZ/bin/shaharsoz --lat 41.3111 --lon 69.2797 --radius 4 --output tashkent_model
+echo 'export PATH="/path/to/SHAHARSOZ/bin:$PATH"' >> ~/.zshrc
+source ~/.zshrc
+shaharsoz --lat 41.3111 --lon 69.2797 --radius 4 --output tashkent_model
 ```
 
 ## Output Structure / Chiqish Tuzilmasi
@@ -52,11 +65,12 @@ Or launcher:
 
 ## Important Flags / Muhim Parametrlar
 
-- `--wayback-layer-id` (default `64001`, use `0` for current Esri World Imagery)
+- `--wayback-layer-id` (default `0` = current Esri World Imagery; set a Wayback id to target snapshot)
 - `--sentinel-upscale` (default `2`, upscales Sentinel preview fallback)
 - `--material-dir` (default `input/materials`)
 - `--ndwi-threshold`
 - `--tree-density`, `--max-trees`
+- `--terrain-osm-overlay` (optional: burns roads/buildings into terrain texture; off by default for cleaner satellite look)
 
 ## Troubleshooting / Muammolarni hal qilish
 
@@ -88,36 +102,61 @@ output/<model>/meshes/blockout_textured.obj
 output/<model>/meshes/blockout_textured.mtl
 ```
 
-### 4) `basemap_rgb_3857.tif` missing
+### 4) Why does Wayback return 404?
 
-If Wayback/current basemap fails, SHAHARSOZ now falls back to Sentinel RGB and writes:
+This is common when a specific Wayback layer id is not available for your exact AOI/date/zoom.
+SHAHARSOZ now automatically falls back:
+1. Wayback requested size retries (4096 -> 2048 -> 1024)
+2. Esri World Imagery retries
+3. Sentinel fallback texture if Esri fails
+
+If needed, force current Esri imagery (skip Wayback):
+
+```bash
+./shaharsoz ... --wayback-layer-id 0
+```
+
+### 5) `basemap_rgb_3857.tif` missing
+
+It should be written to:
 
 ```text
 data/<model>/imagery/basemap_rgb_3857.tif
 ```
 
-### 5) `materials`, `textures`, `vectors`, `lod`, `collision` folders look empty
+If Esri fails, SHAHARSOZ creates it from Sentinel fallback.
+
+### 6) `materials`, `textures`, `vectors`, `lod`, `collision` folders look empty
 
 Most common reasons:
-- Run failed before export (check terminal log for first ERROR).
-- Wrong folder checked (`output/<model>/...` is required).
+- Run failed before export (check first ERROR in logs).
+- Wrong folder checked (`output/<model>/...`).
 - No venv/dependencies active.
-- Input materials missing: app still exports OBJ/MTL, but material images may be limited.
 
-### 6) I did not put any materials in `input/materials`
+### 7) I did not put any materials in `input/materials`
 
-That is allowed. App still exports textured OBJ/MTL. Best quality needs material pack with stems:
+Allowed. App still exports textured OBJ/MTL using available/fallback textures.
+Better quality needs material files:
 `asphalt, cobblestone, concrete, grass, railway, roof, stone, wall_window, water, tree`.
+
+### 8) `terrain_textured.obj` looks black or untextured
+
+Check:
+1. `output/<model>/textures/terrain_texture.png` exists
+2. `output/<model>/meshes/terrain_textured.mtl` has `map_Kd ../textures/terrain_texture.png`
+3. Viewer supports relative MTL texture paths
+
+Tip:
+- Keep default mode for clean terrain texture.
+- Use `--terrain-osm-overlay` only if you want roads/buildings burned into terrain texture.
 
 ## Uninstall / O'chirish
 
-To uninstall SHAHARSOZ from this computer:
+To uninstall SHAHARSOZ:
 
 ```bash
 rm -rf /path/to/SHAHARSOZ
 ```
-
-If installed elsewhere, remove that folder path.
 
 ## Free up space safely / Joy bo'shatish (xavfsiz)
 
@@ -131,6 +170,7 @@ find . -name '__pycache__' -type d -prune -exec rm -rf {} +
 ```
 
 Do **not** delete if you still need app code/config:
+- `shaharsoz`
 - `shaharsoz.py`
 - `utils/`
 - `requirements.txt`
